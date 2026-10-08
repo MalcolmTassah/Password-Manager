@@ -245,77 +245,203 @@ public class PasswordGenerator
     }
 }
 
+
 public static class SecurityManager
 {
-    private static readonly string Key = "12345678901234567890123456789012"; // Must be 32 bytes for AES-256
-    private static readonly string IV = "abcdefghijklmnop"; // Must be 16 bytes for AES
+    private const string MasterFile = "master.dat";
+    private const int SaltSize = 16;
+    private const int KeySize = 32;
+    private const int NonceSize = 12;
+    private const int TagSize = 16;
+    private const int Iterations = 600000;
 
-    // Encrypts a string using AES and returns a base64 encoded result
+    private static byte[] encryptionKey;
+
+    // Derives an AES-256 key from the master password.
+    private static byte[] DeriveKey(string password, byte[] salt)
+    {
+        return Rfc2898DeriveBytes.Pbkdf2(
+            password,
+            salt,
+            Iterations,
+            HashAlgorithmName.SHA256,
+            KeySize
+        );
+    }
+
+    // Encrypts a password using AES-GCM.
     public static string Encrypt(string plainText)
     {
-        using Aes aes = Aes.Create();
-        aes.Key = Encoding.UTF8.GetBytes(Key);
-        aes.IV = Encoding.UTF8.GetBytes(IV);
+        if (encryptionKey == null)
+            throw new InvalidOperationException("Log in first.");
 
-        ICryptoTransform encryptor = aes.CreateEncryptor(aes.Key, aes.IV);
+        byte[] nonce = RandomNumberGenerator.GetBytes(NonceSize);
+        byte[] plaintext = Encoding.UTF8.GetBytes(plainText);
+        byte[] ciphertext = new byte[plaintext.Length];
+        byte[] tag = new byte[TagSize];
 
-        using MemoryStream ms = new MemoryStream();
-        using (CryptoStream cs = new CryptoStream(ms, encryptor, CryptoStreamMode.Write))
-        using (StreamWriter sw = new StreamWriter(cs))
+        using (AesGcm aes = new AesGcm(encryptionKey, TagSize))
         {
-            sw.Write(plainText);
+            aes.Encrypt(nonce, plaintext, ciphertext, tag);
         }
 
-        return Convert.ToBase64String(ms.ToArray());
+        // Store nonce + authentication tag + encrypted password.
+        byte[] result = new byte[NonceSize + TagSize + ciphertext.Length];
+
+        Buffer.BlockCopy(nonce, 0, result, 0, NonceSize);
+        Buffer.BlockCopy(tag, 0, result, NonceSize, TagSize);
+        Buffer.BlockCopy(ciphertext, 0, result,
+            NonceSize + TagSize, ciphertext.Length);
+
+        return Convert.ToBase64String(result);
     }
 
-    // Decrypts a base64 encoded AES-encrypted string
-    public static string Decrypt(string cipherText)
+    // Decrypts a stored password using AES-GCM.
+    public static string Decrypt(string encryptedText)
     {
-        using Aes aes = Aes.Create();
-        aes.Key = Encoding.UTF8.GetBytes(Key);
-        aes.IV = Encoding.UTF8.GetBytes(IV);
+        if (encryptionKey == null)
+            throw new InvalidOperationException("Log in first.");
 
-        ICryptoTransform decryptor = aes.CreateDecryptor(aes.Key, aes.IV);
+        byte[] data = Convert.FromBase64String(encryptedText);
 
-        using MemoryStream ms = new MemoryStream(Convert.FromBase64String(cipherText));
-        using CryptoStream cs = new CryptoStream(ms, decryptor, CryptoStreamMode.Read);
-        using StreamReader sr = new StreamReader(cs);
+        if (data.Length < NonceSize + TagSize)
+            throw new CryptographicException("Invalid encrypted data.");
 
-        return sr.ReadToEnd();
+        byte[] nonce = data[..NonceSize];
+        byte[] tag = data[NonceSize..(NonceSize + TagSize)];
+        byte[] ciphertext = data[(NonceSize + TagSize)..];
+        byte[] plaintext = new byte[ciphertext.Length];
+
+        using (AesGcm aes = new AesGcm(encryptionKey, TagSize))
+        {
+            aes.Decrypt(nonce, ciphertext, tag, plaintext);
+        }
+
+        return Encoding.UTF8.GetString(plaintext);
     }
 
-    // Hashes a string using SHA256
-    public static string Hash(string input)
-    {
-        using SHA256 sha256 = SHA256.Create();
-        byte[] inputBytes = Encoding.UTF8.GetBytes(input);
-        byte[] hashBytes = sha256.ComputeHash(inputBytes);
-        return Convert.ToBase64String(hashBytes);
-    }
-
-    // Verifies the master password by comparing hashed input with stored hash
+    // Verifies the master password and initializes the encryption key.
     public static bool VerifyMasterPassword()
     {
-        string hashFile = "master.hash";
-
-        if (!File.Exists(hashFile)) // First time setup - save hashed password
+        if (!File.Exists(MasterFile))
         {
             Console.Write("Create a master password: ");
-            string newPassword = Console.ReadLine();
-            string hashed = Hash(newPassword);
-            File.WriteAllText(hashFile, hashed);
-            Console.WriteLine("Master password set. Restart the application to log in.");
+            string password = Console.ReadLine();
+
+            if (string.IsNullOrWhiteSpace(password))
+            {
+                Console.WriteLine("Master password cannot be empty.");
+                return false;
+            }
+
+            byte[] salt = RandomNumberGenerator.GetBytes(SaltSize);
+            byte[] key = DeriveKey(password, salt);
+
+            // Store an encrypted verification value.
+            byte[] nonce = RandomNumberGenerator.GetBytes(NonceSize);
+            byte[] verification = Encoding.UTF8.GetBytes("PasswordManager");
+            byte[] ciphertext = new byte[verification.Length];
+            byte[] tag = new byte[TagSize];
+
+            using (AesGcm aes = new AesGcm(key, TagSize))
+            {
+                aes.Encrypt(nonce, verification, ciphertext, tag);
+            }
+
+            // File format: salt + nonce + tag + ciphertext
+            byte[] fileData = new byte[
+                SaltSize + NonceSize + TagSize + ciphertext.Length
+            ];
+
+            int offset = 0;
+
+            Buffer.BlockCopy(salt, 0, fileData, offset, SaltSize);
+            offset += SaltSize;
+
+            Buffer.BlockCopy(nonce, 0, fileData, offset, NonceSize);
+            offset += NonceSize;
+
+            Buffer.BlockCopy(tag, 0, fileData, offset, TagSize);
+            offset += TagSize;
+
+            Buffer.BlockCopy(ciphertext, 0, fileData, offset,
+                ciphertext.Length);
+
+            File.WriteAllBytes(MasterFile, fileData);
+
+            CryptographicOperations.ZeroMemory(key);
+
+            Console.WriteLine("Master password created. Restart to log in.");
             Environment.Exit(0);
+            return false;
         }
 
         Console.Write("Enter master password: ");
         string input = Console.ReadLine();
-        string hashedInput = Hash(input);
-        string storedHash = File.ReadAllText(hashFile);
 
-        return hashedInput == storedHash;
+        if (input == null)
+            return false;
+
+        byte[] storedData = File.ReadAllBytes(MasterFile);
+
+        if (storedData.Length < SaltSize + NonceSize + TagSize)
+        {
+            Console.WriteLine("Invalid master password file.");
+            return false;
+        }
+
+        byte[] storedSalt = storedData[..SaltSize];
+
+        byte[] storedNonce =
+            storedData[SaltSize..(SaltSize + NonceSize)];
+
+        byte[] storedTag =
+            storedData[(SaltSize + NonceSize)..
+                (SaltSize + NonceSize + TagSize)];
+
+        byte[] storedCiphertext =
+            storedData[(SaltSize + NonceSize + TagSize)..];
+
+        byte[] derivedKey = DeriveKey(input, storedSalt);
+        byte[] decrypted = new byte[storedCiphertext.Length];
+
+        try
+        {
+            using (AesGcm aes = new AesGcm(derivedKey, TagSize))
+            {
+                aes.Decrypt(
+                    storedNonce,
+                    storedCiphertext,
+                    storedTag,
+                    decrypted
+                );
+            }
+
+            bool valid = CryptographicOperations.FixedTimeEquals(
+                decrypted,
+                Encoding.UTF8.GetBytes("PasswordManager")
+            );
+
+            if (!valid)
+            {
+                CryptographicOperations.ZeroMemory(derivedKey);
+                return false;
+            }
+
+            encryptionKey = derivedKey;
+            return true;
+        }
+        catch (CryptographicException)
+        {
+            CryptographicOperations.ZeroMemory(derivedKey);
+            return false;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(decrypted);
+        }
     }
 }
+
 
         
