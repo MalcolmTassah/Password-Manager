@@ -1,0 +1,9 @@
+# Sensitive application data
+passwords.db
+master.dat
+master.hash
+
+# Generated build files
+bin/
+obj/
+.vs/
